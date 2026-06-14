@@ -1,0 +1,967 @@
+"""castlevania_mountain.py
+   A Castlevania-style side-scrolling action platformer using
+   the parallax mountain assets and thief sprite sheets.
+
+   Controls:
+     A / LEFT  – move left
+     D / RIGHT – move right
+     SPACE / UP – jump (double-jump supported)
+     Z         – attack
+     ESC / Q   – quit
+
+   Objective: Defeat the skeleton enemies patrolling the mountain.
+              Each kill earns score. Lose all HP → Game Over.
+"""
+
+import pygame, sys, math, random, os
+
+# ── Asset path ──────────────────────────────────────────────────────────────
+ASSETS_DIR = os.path.join(os.path.dirname(__file__), "assets")
+
+def asset(filename):
+    """Return the full path to an asset file."""
+    return os.path.join(ASSETS_DIR, filename)
+pygame.init()
+pygame.mixer.init()
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+DISPLAY_W, DISPLAY_H = 816, 480
+SCALE = 3
+GROUND_Y = DISPLAY_H - 32   # y-coord where feet land
+
+FPS = 60
+GRAVITY = 0.6
+MAX_FALL = 18
+
+# Colors
+WHITE   = (255, 255, 255)
+BLACK   = (0,   0,   0)
+RED     = (220,  40,  40)
+GOLD    = (255, 210,  50)
+DARK    = ( 20,  10,  30)
+CRIMSON = (180,  20,  20)
+HPGREEN = ( 50, 200,  80)
+HPRED   = (180,  30,  30)
+
+screen = pygame.display.set_mode((DISPLAY_W, DISPLAY_H))
+pygame.display.set_caption("Mountain of Shadows")
+clock  = pygame.time.Clock()
+
+# ── Asset helpers ─────────────────────────────────────────────────────────────
+def load_scaled(path, scale=SCALE):
+    img = pygame.image.load(path).convert_alpha()
+    w, h = img.get_size()
+    return pygame.transform.scale(img, (w * scale, h * scale))
+
+def load_raw(path):
+    return pygame.image.load(path).convert_alpha()
+
+# ── Background / parallax layers ──────────────────────────────────────────────
+CANVAS_W = DISPLAY_W * 4   # scroll canvas
+
+class ParallaxLayer:
+    def __init__(self, path, dx_speed, scale=SCALE):
+        base = load_scaled(path, scale)
+        bw, bh = base.get_size()
+        self.surf = pygame.Surface((CANVAS_W + bw, DISPLAY_H), pygame.SRCALPHA)
+        for x in range(0, CANVAS_W + bw, bw):
+            self.surf.blit(base, (x, DISPLAY_H - bh))
+        self.tile_w = bw
+        self.speed  = dx_speed
+        self.offset = 0.0          # sub-pixel accumulator
+
+    def scroll(self, world_dx):
+        self.offset += world_dx * self.speed
+        # wrap
+        while self.offset >  self.tile_w: self.offset -= self.tile_w
+        while self.offset < -self.tile_w: self.offset += self.tile_w
+
+    def draw(self, surf):
+        ox = int(self.offset)
+        surf.blit(self.surf, (-ox % self.tile_w - self.tile_w, 0))
+        surf.blit(self.surf, (-ox % self.tile_w, 0))
+
+class BGSky:
+    def __init__(self, path):
+        base = load_scaled(path)
+        bw, bh = base.get_size()
+        self.surf = pygame.Surface((CANVAS_W, DISPLAY_H), pygame.SRCALPHA)
+        for x in range(0, CANVAS_W, bw):
+            self.surf.blit(base, (x, 0))
+    def draw(self, surf):
+        surf.blit(self.surf, (0, 0))
+
+class GroundLayer:
+    def __init__(self, path):
+        tile = load_raw(path)
+        tw, th = tile.get_size()
+        self.surf = pygame.Surface((CANVAS_W + tw, th), pygame.SRCALPHA)
+        for x in range(0, CANVAS_W + tw, tw):
+            self.surf.blit(tile, (x, 0))
+        self.tile_w = tw
+        self.offset = 0.0
+        self.speed  = 1.0   # matches the player's visual speed
+
+    def scroll(self, world_dx):
+        self.offset += world_dx
+        while self.offset >  self.tile_w: self.offset -= self.tile_w
+        while self.offset < -self.tile_w: self.offset += self.tile_w
+
+    def draw(self, surf):
+        ox = int(self.offset)
+        y  = DISPLAY_H - self.surf.get_height()
+        surf.blit(self.surf, (-ox % self.tile_w - self.tile_w, y))
+        surf.blit(self.surf, (-ox % self.tile_w, y))
+
+# ── Fonts ──────────────────────────────────────────────────────────────────────
+try:
+    font_big   = pygame.font.SysFont("Georgia", 48, bold=True)
+    font_mid   = pygame.font.SysFont("Georgia", 28, bold=True)
+    font_small = pygame.font.SysFont("Georgia", 18)
+except:
+    font_big   = pygame.font.Font(None, 48)
+    font_mid   = pygame.font.Font(None, 28)
+    font_small = pygame.font.Font(None, 18)
+
+# ── Particles ──────────────────────────────────────────────────────────────────
+particles = []
+
+def spawn_hit_particles(x, y, color=RED, n=12):
+    for _ in range(n):
+        angle = random.uniform(0, math.tau)
+        speed = random.uniform(2, 6)
+        lifetime = random.randint(18, 35)
+        particles.append([x, y, math.cos(angle)*speed, math.sin(angle)*speed,
+                          lifetime, lifetime, color])
+
+def update_draw_particles(surf):
+    alive = []
+    for p in particles:
+        p[0] += p[2]; p[1] += p[3]
+        p[3] += 0.3          # gravity on particle
+        p[4] -= 1
+        if p[4] > 0:
+            alpha = int(255 * p[4] / p[5])
+            r,g,b = p[6]
+            size = max(1, int(3 * p[4]/p[5]))
+            s = pygame.Surface((size*2, size*2), pygame.SRCALPHA)
+            pygame.draw.circle(s, (r,g,b,alpha), (size,size), size)
+            surf.blit(s, (int(p[0])-size, int(p[1])-size))
+            alive.append(p)
+    particles[:] = alive
+
+# ── Thief (player) ────────────────────────────────────────────────────────────
+class Player:
+    SPRITE_HEIGHT = 150   # scale all player frames to this height
+
+    ANIM_SPEED    = 6     # ticks per frame
+    MAX_HP        = 5
+    ATTACK_DAMAGE = 2
+    ATTACK_REACH  = 100
+
+    @staticmethod
+    def _load_frame(path):
+        img = pygame.image.load(path).convert_alpha()
+        ow, oh = img.get_size()
+        nh = Player.SPRITE_HEIGHT
+        nw = int(ow * nh / oh)
+        return pygame.transform.scale(img, (nw, nh))
+
+    def __init__(self):
+        self.idle_frame    = self._load_frame(asset("thief_idle.png"))
+        self.walk_frames   = [self._load_frame(asset(f"walk{i}.png"))   for i in range(1, 7)]
+        self.jump_frames   = [self._load_frame(asset(f"jump{i}.png"))   for i in range(1, 3)]
+        all_atk = [self._load_frame(asset(f"attack{i}.png")) for i in range(1, 10)]
+        self.attack_frames   = all_atk[:4]   # first combo (frames 1-4)
+        self.attack2_frames  = all_atk[4:]   # follow-up combo (frames 5-9)
+
+        self.x   = float(DISPLAY_W // 3)
+        self.y   = float(GROUND_Y)
+        self.vx  = 0.0
+        self.vy  = 0.0
+        self.on_ground = True
+        self.jumps_left = 2        # allow double-jump
+
+        self.facing_right = True
+        self.frame_idx  = 0
+        self.tick       = 0
+
+        self.attacking      = False
+        self.attack_frame   = 0
+        self.attack_tick    = 0
+        self.attack_hit     = False   # has this swing already landed?
+        self.combo_count    = 0       # 0=first swing, 1=follow-up
+        self.combo_window   = 0       # frames left to trigger follow-up
+
+        self.hp      = self.MAX_HP
+        self.invuln       = 0
+        self.stagger_timer = 0             # invulnerability frames after hit
+        self.score   = 0
+        self.dead    = False
+
+        self.image = self.idle_frame
+
+    # ── physics & input ───────────────────────────────────────────────────────
+    def handle_input(self, events):
+        keys = pygame.key.get_pressed()
+
+        # horizontal
+        speed = 5
+        self.vx = 0
+        if keys[pygame.K_LEFT]  or keys[pygame.K_a]:
+            self.vx = -speed
+            self.facing_right = False
+        if keys[pygame.K_RIGHT] or keys[pygame.K_d]:
+            self.vx = speed
+            self.facing_right = True
+
+        # jump (event-based for reliability)
+        for ev in events:
+            if ev.type == pygame.KEYDOWN:
+                if ev.key in (pygame.K_SPACE, pygame.K_UP, pygame.K_w):
+                    if self.jumps_left > 0:
+                        self.vy = -14
+                        self.jumps_left -= 1
+                        self.on_ground = False
+                if ev.key == pygame.K_z:
+                    if not self.attacking:
+                        self.attacking    = True
+                        self.attack_frame = 0
+                        self.attack_tick  = 0
+                        self.attack_hit   = False
+                        self.combo_count  = 0
+                        self.combo_window = 0
+                    elif self.combo_window > 0 and self.combo_count == 0:
+                        # Queue follow-up: restart anim with second set
+                        self.combo_count  = 1
+                        self.attack_frame = 0
+                        self.attack_tick  = 0
+                        self.attack_hit   = False
+                        self.combo_window = 0
+
+    def update(self):
+        if self.dead:
+            return
+
+        # gravity
+        self.vy += GRAVITY
+        if self.vy > MAX_FALL:
+            self.vy = MAX_FALL
+        self.y += self.vy
+
+        # ground collision
+        if self.y >= GROUND_Y:
+            self.y = float(GROUND_Y)
+            self.vy = 0
+            self.on_ground  = True
+            self.jumps_left = 2
+
+        # screen clamp (horizontal)
+        if self.x < 30:             self.x = 30
+        if self.x > DISPLAY_W - 30: self.x = float(DISPLAY_W - 30)
+
+        # invulnerability countdown
+        if self.invuln > 0:
+            self.invuln -= 1
+
+        # ── animation ────────────────────────────────────────────────────────
+        if self.attacking:
+            frames = self.attack2_frames if self.combo_count == 1 else self.attack_frames
+            self.attack_tick += 1
+            if self.attack_tick >= self.ANIM_SPEED:
+                self.attack_tick = 0
+                self.attack_frame += 1
+                if self.attack_frame >= len(frames):
+                    self.attacking    = False
+                    self.attack_frame = 0
+                    self.attack_hit   = False
+                    self.combo_window = 0
+                elif self.attack_frame == len(frames) - 1 and self.combo_count == 0:
+                    self.combo_window = 18  # open window for follow-up
+            if self.combo_window > 0:
+                self.combo_window -= 1
+            base = frames[min(self.attack_frame, len(frames)-1)]
+
+        elif not self.on_ground:
+            frames = self.jump_frames
+            self.tick += 1
+            if self.tick >= self.ANIM_SPEED:
+                self.tick = 0
+                if self.frame_idx < len(frames) - 1:
+                    self.frame_idx += 1
+            base = frames[self.frame_idx]
+
+        else:
+            if self.vx != 0:
+                frames = self.walk_frames
+                self.tick += 1
+                if self.tick >= self.ANIM_SPEED:
+                    self.tick = 0
+                    self.frame_idx = (self.frame_idx + 1) % len(frames)
+                self.frame_idx = min(self.frame_idx, len(frames)-1)
+                base = frames[self.frame_idx]
+            else:
+                self.frame_idx = 0
+                self.tick = 0
+                base = self.idle_frame
+
+        if not self.on_ground:
+            self.frame_idx = min(self.frame_idx, len(self.jump_frames)-1)
+
+        if not self.facing_right:
+            base = pygame.transform.flip(base, True, False)
+        self.image = base
+
+    def take_hit(self, damage=1):
+        if self.invuln > 0:
+            return
+        self.hp -= damage
+        self.invuln = 60
+        spawn_hit_particles(int(self.x), int(self.y) - 40, RED, 16)
+        if self.hp <= 0:
+            self.hp   = 0
+            self.dead = True
+
+    def attack_rect(self):
+        """Returns world-space rect for current attack swing, or None."""
+        if not self.attacking or self.attack_hit:
+            return None
+        cx = int(self.x)
+        cy = int(self.y) - 50
+        reach = self.ATTACK_REACH
+        if self.facing_right:
+            return pygame.Rect(cx, cy - 20, reach, 50)
+        else:
+            return pygame.Rect(cx - reach, cy - 20, reach, 50)
+
+    def draw(self, surf):
+        if self.dead:
+            return
+        img = self.image
+        iw, ih = img.get_size()
+        surf.blit(img, (int(self.x) - iw//2, int(self.y) - ih))
+
+    # How much the world should scroll this frame (so bg layers move)
+    def world_scroll_dx(self):
+        """Returns the portion of vx that should move the WORLD instead of player."""
+        # Player is locked in a centre band; outside that the world scrolls
+        left_edge  = DISPLAY_W * 0.25
+        right_edge = DISPLAY_W * 0.75
+
+        if self.vx > 0 and self.x >= right_edge:
+            self.x = right_edge
+            return self.vx
+        if self.vx < 0 and self.x <= left_edge:
+            self.x = left_edge
+            return self.vx
+        self.x += self.vx
+        return 0.0
+
+# ── Skeleton enemy ────────────────────────────────────────────────────────────
+
+class Skeleton:
+    HP_MAX   = 3
+    SPEED    = 1.2  # base; scaled per instance
+    DAMAGE   = 1
+    ATTACK_RANGE  = 55
+    ATTACK_COOLDOWN = 90   # frames
+
+    # Sprite sheet file names (loaded once at class level after pygame init)
+    _sprites_loaded = False
+    _walk_frames   = []
+    _attack_frames = []
+    _damage_frames = []
+    _idle_frame    = None
+    ANIM_SPEED     = 6   # ticks per frame
+
+    # Base height — each instance scales this by its size_scale
+    BASE_HEIGHT = 120
+    MIN_SCALE   = 0.8
+    MAX_SCALE   = 1.6
+
+    @classmethod
+    def _load_one(cls, path, height):
+        img = pygame.image.load(path).convert_alpha()
+        ow, oh = img.get_size()
+        nw = int(ow * height / oh)
+        return pygame.transform.scale(img, (nw, height))
+
+    def _load_instance_sprites(self, height):
+        """Load sprites scaled to this instance's height."""
+        self._idle_frame    = self._load_one(asset("skel_idle.png"), height)
+        self._walk_frames   = [self._load_one(asset(f"skel_walk{i}.png"),   height) for i in range(1, 6)]
+        self._attack_frames = [self._load_one(asset(f"skel_attack{i}.png"), height) for i in range(1, 6)]
+        self._damage_frames = [self._load_one(asset(f"skel_damage{i}.png"), height) for i in range(1, 3)]
+
+    def __init__(self, x, lvl_mgr=None):
+        # Randomise size — bigger = more HP and score; range grows with level
+        lo, hi = lvl_mgr.enemy_scale_range() if lvl_mgr else (self.MIN_SCALE, self.MAX_SCALE)
+        self.size_scale = random.uniform(lo, hi)
+        height = int(self.BASE_HEIGHT * self.size_scale)
+        self._load_instance_sprites(height)
+
+        self.hp_max = max(1, round(self.HP_MAX * self.size_scale))
+        self.x   = float(x)
+        self.y   = float(GROUND_Y)
+        self.hp  = self.hp_max
+        self.speed = self.SPEED / (self.size_scale ** 0.5)  # bigger = slightly slower
+        self.direction = -1.0   # -1 left, +1 right
+        self.tick       = 0
+        self.alive      = True
+        self.death_timer = 0
+        self.attack_cooldown = 0
+        self.aggro   = False     # chasing player?
+        self.invuln  = 0
+
+        # animation state
+        self.anim_tick  = 0
+        self.anim_frame = 0
+        self.state      = "idle"  # idle | walk | attack | damage | death
+
+        # patrol bounds
+        self.patrol_start = x - 150
+        self.patrol_end   = x + 150
+
+    # ── animation helpers ─────────────────────────────────────────────────────
+    def _advance_anim(self, num_frames, loop=True):
+        self.anim_tick += 1
+        if self.anim_tick >= self.ANIM_SPEED:
+            self.anim_tick = 0
+            self.anim_frame += 1
+            if self.anim_frame >= num_frames:
+                if loop:
+                    self.anim_frame = 0
+                else:
+                    self.anim_frame = num_frames - 1
+                    return True   # animation finished
+        return False
+
+    def _set_state(self, new_state):
+        if self.state != new_state:
+            self.state      = new_state
+            self.anim_frame = 0
+            self.anim_tick  = 0
+
+    def update(self, player_x, world_offset, attack_rect):
+        if not self.alive:
+            self.death_timer += 1
+            self._advance_anim(len(self._damage_frames), loop=False)
+            return
+
+        self.tick += 1
+
+        if self.attack_cooldown > 0:
+            self.attack_cooldown -= 1
+        if self.invuln > 0:
+            self.invuln -= 1
+        if hasattr(self, 'stagger_timer') and self.stagger_timer > 0:
+            self.stagger_timer -= 1
+
+        screen_skel_x   = self.x - world_offset
+        screen_player_x = player_x
+        dx_to_player    = screen_player_x - screen_skel_x
+        dist            = abs(dx_to_player)
+
+        # ── Aggro ────────────────────────────────────────────────────────────
+        if dist < 350:
+            self.aggro = True
+        if dist > 600:
+            self.aggro = False
+
+        # ── State machine ────────────────────────────────────────────────────
+        if self.state == "damage":
+            done = self._advance_anim(len(self._damage_frames), loop=False)
+            if done:
+                self._set_state("idle")
+            return False   # can't act while staggered
+
+        if self.state == "attack":
+            done = self._advance_anim(len(self._attack_frames), loop=False)
+            if done:
+                self._set_state("idle")
+            # still check if we hit the player during attack frames
+            if dist < self.ATTACK_RANGE and self.attack_cooldown == 0 and self.aggro:
+                self.attack_cooldown = self.ATTACK_COOLDOWN
+                return True
+            return False
+
+        # ── Patrol (not aggro) ───────────────────────────────────────────────
+        if not self.aggro:
+            wx = self.x - world_offset
+            if self.direction > 0 and wx > self.patrol_end - world_offset + 150:
+                self.direction = -1.0
+            elif self.direction < 0 and wx < self.patrol_start - world_offset - 150:
+                self.direction = 1.0
+            self.x += self.direction * self.speed
+            self._set_state("walk")
+            self._advance_anim(len(self._walk_frames))
+
+        # ── Chase + combat AI (aggro) ────────────────────────────────────────
+        else:
+            self.direction = 1.0 if dx_to_player > 0 else -1.0
+
+            if dist <= self.ATTACK_RANGE:
+                # In melee range — attack if off cooldown, else stand and wait
+                self._set_state("idle")
+                if self.attack_cooldown == 0:
+                    self.attack_cooldown = self.ATTACK_COOLDOWN
+                    self._set_state("attack")
+                    self._advance_anim(len(self._attack_frames), loop=False)
+                    return True   # deal damage
+
+            elif dist < 180:
+                # Close — walk straight at player
+                self.x += self.direction * self.speed
+                self._set_state("walk")
+                self._advance_anim(len(self._walk_frames))
+
+            elif dist < 350:
+                # Medium range — occasionally pause/feint to feel less robotic
+                if self.tick % 90 < 60:          # walk 60 ticks
+                    self.x += self.direction * self.speed
+                    self._set_state("walk")
+                    self._advance_anim(len(self._walk_frames))
+                else:                            # idle 30 ticks (brief hesitation)
+                    self._set_state("idle")
+
+        # ── Check player attack hits skeleton ────────────────────────────────
+        if attack_rect is not None and self.invuln == 0:
+            skel_rect = pygame.Rect(int(screen_skel_x) - 20, int(self.y) - 90, 40, 90)
+            if attack_rect.colliderect(skel_rect):
+                self.take_hit(1, screen_skel_x)
+
+        return False
+
+    def take_hit(self, dmg, screen_x):
+        if self.invuln > 0:
+            return
+        self.hp -= dmg
+        self.invuln = 20
+        spawn_hit_particles(int(screen_x), int(self.y) - 40, GOLD, 14)
+        if self.hp <= 0:
+            self.alive = False
+            self.death_timer = 0
+            self._set_state("damage")
+            spawn_hit_particles(int(screen_x), int(self.y) - 40, RED, 24)
+        else:
+            self._set_state("damage")
+
+    def _get_current_frame(self):
+        """Return the correct sprite surface for the current state."""
+        if self.state == "attack" and self._attack_frames:
+            frames = self._attack_frames
+        elif self.state == "damage" and self._damage_frames:
+            frames = self._damage_frames
+        elif self.state == "walk" and self._walk_frames:
+            frames = self._walk_frames
+        else:
+            return self._idle_frame if self._idle_frame else self._walk_frames[0]
+
+        idx = min(self.anim_frame, len(frames) - 1)
+        return frames[idx]
+
+    def draw(self, surf, world_offset):
+        sx = int(self.x - world_offset)
+        sy = int(self.y)
+
+        img = self._get_current_frame()
+
+        # Flip to face direction (sprites default face right)
+        if self.direction < 0:
+            img = pygame.transform.flip(img, True, False)
+
+        iw, ih = img.get_size()
+        # Anchor: feet at sy (GROUND_Y). All frames cropped so ih is actual sprite height.
+        draw_x = sx - iw // 2
+        draw_y = sy - ih
+
+        # Fade out on death
+        if not self.alive:
+            if self.death_timer >= 40:
+                return
+            alpha = max(0, 255 - self.death_timer * 6)
+            img = img.copy()
+            img.set_alpha(alpha)
+            surf.blit(img, (draw_x, draw_y))
+            return
+
+        # Flash white on hit
+        if self.invuln > 0 and (self.invuln // 3) % 2 == 0:
+            img = img.copy()
+            img.fill((255, 255, 255, 180), special_flags=pygame.BLEND_RGBA_ADD)
+
+        surf.blit(img, (draw_x, draw_y))
+
+        # HP bar above sprite
+        if self.hp < self.hp_max:
+            bar_w = 36
+            bx = sx - bar_w // 2
+            by = draw_y - 8
+            pygame.draw.rect(surf, HPRED,   (bx, by, bar_w, 5))
+            pygame.draw.rect(surf, HPGREEN, (bx, by, int(bar_w * self.hp / self.hp_max), 5))
+
+    @property
+    def screen_dead_and_done(self):
+        return not self.alive and self.death_timer >= 40
+
+# ── HUD ────────────────────────────────────────────────────────────────────────
+def draw_hud(surf, player):
+    # Panel background
+    panel = pygame.Surface((250, 70), pygame.SRCALPHA)
+    panel.fill((0, 0, 0, 140))
+    surf.blit(panel, (10, 10))
+
+    # Title
+    t = font_small.render("MOUNTAIN OF SHADOWS", True, GOLD)
+    surf.blit(t, (18, 14))
+
+    # HP pips
+    for i in range(player.MAX_HP):
+        col = CRIMSON if i < player.hp else (60, 30, 30)
+        pygame.draw.rect(surf, col, (18 + i*26, 34, 20, 20))
+        pygame.draw.rect(surf, GOLD, (18 + i*26, 34, 20, 20), 1)
+        if i < player.hp:
+            # heart shape (simple diamond)
+            cx = 18 + i*26 + 10
+            cy = 34 + 10
+            pts = [(cx, cy-6),(cx+6, cy),(cx, cy+6),(cx-6, cy)]
+            pygame.draw.polygon(surf, (255,100,100), pts)
+
+    # Score
+    sc = font_small.render(f"SCORE  {player.score:05d}", True, WHITE)
+    surf.blit(sc, (18, 56))
+
+    # Controls hint (bottom)
+    hint = font_small.render("ARROWS/WASD:move  SPACE:jump  Z:attack", True, (180,180,180))
+    hs = pygame.Surface((hint.get_width()+10, hint.get_height()+4), pygame.SRCALPHA)
+    hs.fill((0,0,0,100))
+    surf.blit(hs, (DISPLAY_W//2 - hs.get_width()//2, DISPLAY_H - 22))
+    surf.blit(hint, (DISPLAY_W//2 - hint.get_width()//2, DISPLAY_H - 20))
+
+def draw_game_over(surf, score):
+    overlay = pygame.Surface((DISPLAY_W, DISPLAY_H), pygame.SRCALPHA)
+    overlay.fill((0, 0, 0, 180))
+    surf.blit(overlay, (0,0))
+
+    t1 = font_big.render("GAME OVER", True, CRIMSON)
+    t2 = font_mid.render(f"Final Score: {score:05d}", True, GOLD)
+    t3 = font_small.render("Press R to restart  |  ESC to quit", True, WHITE)
+
+    surf.blit(t1, (DISPLAY_W//2 - t1.get_width()//2, 160))
+    surf.blit(t2, (DISPLAY_W//2 - t2.get_width()//2, 230))
+    surf.blit(t3, (DISPLAY_W//2 - t3.get_width()//2, 290))
+
+def draw_title(surf):
+    overlay = pygame.Surface((DISPLAY_W, DISPLAY_H), pygame.SRCALPHA)
+    overlay.fill((0, 0, 0, 160))
+    surf.blit(overlay, (0,0))
+
+    t1 = font_big.render("MOUNTAIN OF SHADOWS", True, GOLD)
+    t3 = font_small.render("Press any key to begin", True, WHITE)
+
+    surf.blit(t1, (DISPLAY_W//2 - t1.get_width()//2, 140))
+    surf.blit(t3, (DISPLAY_W//2 - t3.get_width()//2, 310))
+
+
+# ── Level system ──────────────────────────────────────────────────────────────
+class LevelManager:
+    """Tracks the current level and scales enemy difficulty."""
+
+    def __init__(self):
+        self.level          = 1
+        self.kills_needed   = self._kills_for(1)
+        self.kills_this_lvl = 0
+        self.level_up_timer = 0        # >0 = showing level-up banner
+        self.BANNER_FRAMES  = 180      # 3 seconds at 60 fps
+
+    def _kills_for(self, lvl):
+        return 3 + (lvl - 1) * 2      # 3, 5, 7, 9 …
+
+    @property
+    def showing_banner(self):
+        return self.level_up_timer > 0
+
+    def register_kill(self):
+        self.kills_this_lvl += 1
+        if self.kills_this_lvl >= self.kills_needed:
+            self.kills_this_lvl = 0
+            self.level += 1
+            self.kills_needed   = self._kills_for(self.level)
+            self.level_up_timer = self.BANNER_FRAMES
+            return True   # levelled up
+        return False
+
+    def update(self):
+        if self.level_up_timer > 0:
+            self.level_up_timer -= 1
+
+    # Difficulty knobs ---------------------------------------------------------
+    def enemy_scale_range(self):
+        """MIN/MAX size_scale grows slightly each level."""
+        lo = min(0.8 + (self.level - 1) * 0.05, 1.1)
+        hi = min(1.6 + (self.level - 1) * 0.08, 2.4)
+        return lo, hi
+
+    def spawn_interval(self):
+        """Frames between spawns — shrinks each level, floor 150."""
+        return max(150, 420 - (self.level - 1) * 30)
+
+    def max_enemies(self):
+        """More enemies on screen at higher levels."""
+        return min(3 + self.level, 10)
+
+
+def draw_level_banner(surf, lvl_mgr):
+    """Animated level-up banner shown for BANNER_FRAMES frames."""
+    t = lvl_mgr.level_up_timer
+    total = lvl_mgr.BANNER_FRAMES
+    # Fade in for first 20 frames, fade out for last 40
+    if t > total - 20:
+        alpha = int(255 * (total - t) / 20)
+    elif t < 40:
+        alpha = int(255 * t / 40)
+    else:
+        alpha = 255
+
+    panel = pygame.Surface((420, 80), pygame.SRCALPHA)
+    panel.fill((0, 0, 0, min(alpha, 160)))
+    px = DISPLAY_W // 2 - 210
+    py = DISPLAY_H // 2 - 60
+    surf.blit(panel, (px, py))
+
+    def ra(color):
+        return (*color[:3], alpha)
+
+    t1 = font_big.render(f"LEVEL  {lvl_mgr.level}", True, GOLD)
+    t2 = font_small.render(f"Defeat {lvl_mgr.kills_needed} skeletons to advance", True, WHITE)
+    t1.set_alpha(alpha); t2.set_alpha(alpha)
+    surf.blit(t1, (DISPLAY_W // 2 - t1.get_width() // 2, py + 4))
+    surf.blit(t2, (DISPLAY_W // 2 - t2.get_width() // 2, py + 54))
+
+
+def draw_level_hud(surf, lvl_mgr):
+    """Small level + progress bar in top-right corner."""
+    lbl = font_small.render(f"LVL {lvl_mgr.level}", True, GOLD)
+    surf.blit(lbl, (DISPLAY_W - 120, 14))
+    # Kill progress bar
+    bar_w = 100
+    bx = DISPLAY_W - 120
+    by = 34
+    prog = lvl_mgr.kills_this_lvl / max(lvl_mgr.kills_needed, 1)
+    pygame.draw.rect(surf, (60, 30, 30),  (bx, by, bar_w, 8))
+    pygame.draw.rect(surf, CRIMSON,       (bx, by, int(bar_w * prog), 8))
+    pygame.draw.rect(surf, GOLD,          (bx, by, bar_w, 8), 1)
+    kills_lbl = font_small.render(f"{lvl_mgr.kills_this_lvl}/{lvl_mgr.kills_needed}", True, WHITE)
+    surf.blit(kills_lbl, (DISPLAY_W - 120, 44))
+
+
+# ── Health drops ─────────────────────────────────────────────────────────────
+class HealthDrop:
+    DROP_CHANCE  = 0.35   # 35 % chance on kill
+    LIFETIME     = 360    # frames before it disappears (6 s)
+    BOB_AMP      = 4      # pixels of vertical bobbing
+    BOB_SPEED    = 0.08
+
+    def __init__(self, world_x):
+        self.world_x  = float(world_x)
+        self.y        = float(GROUND_Y - 20)
+        self.timer    = 0
+        self.collected = False
+
+    def update(self, player_x, world_offset):
+        if self.collected:
+            return False
+        self.timer += 1
+        screen_x = self.world_x - world_offset
+        # Simple pick-up collision — generous radius
+        if abs(screen_x - player_x) < 30 and abs(self.y - GROUND_Y + 20) < 40:
+            self.collected = True
+            return True   # signal: heal player
+        return False
+
+    @property
+    def expired(self):
+        return self.timer >= self.LIFETIME or self.collected
+
+    def draw(self, surf, world_offset):
+        if self.collected:
+            return
+        sx = int(self.world_x - world_offset)
+        bob = math.sin(self.timer * self.BOB_SPEED) * self.BOB_AMP
+        cy = int(self.y + bob)
+
+        # Fade out in last 90 frames
+        alpha = 255
+        if self.timer > self.LIFETIME - 90:
+            alpha = int(255 * (self.LIFETIME - self.timer) / 90)
+
+        # Draw a glowing heart
+        size = 10
+        heart = pygame.Surface((size*2+4, size*2+4), pygame.SRCALPHA)
+        # Two circles + a triangle = heart shape
+        col = (220, 60, 60, alpha)
+        pygame.draw.circle(heart, col, (5, 6),  6)
+        pygame.draw.circle(heart, col, (17, 6), 6)
+        pts = [(1, 9), (23, 9), (12, 22)]
+        pygame.draw.polygon(heart, col, pts)
+        # Bright highlight
+        pygame.draw.circle(heart, (255, 160, 160, min(alpha, 200)), (7, 5), 3)
+        surf.blit(heart, (sx - size - 2, cy - size - 2))
+
+        # Subtle glow ring
+        if alpha > 60:
+            glow = pygame.Surface((36, 36), pygame.SRCALPHA)
+            pygame.draw.circle(glow, (220, 60, 60, alpha // 5), (18, 18), 16)
+            surf.blit(glow, (sx - 18, cy - 18))
+
+
+# ── Enemy spawner ──────────────────────────────────────────────────────────────
+def maybe_spawn(enemies, world_offset, frame_count, lvl_mgr):
+    interval = lvl_mgr.spawn_interval()
+    max_e    = lvl_mgr.max_enemies()
+    if len(enemies) < max_e and frame_count % interval == 0:
+        spawn_x = world_offset + DISPLAY_W + random.randint(50, 200)
+        sk = Skeleton(spawn_x, lvl_mgr)
+        enemies.append(sk)
+
+
+# ── Main game loop ─────────────────────────────────────────────────────────────
+def run_game():
+    # Load layers
+    bg          = BGSky(asset("parallax-mountain-bg.png"))
+    far_mtn     = ParallaxLayer(asset("parallax-mountain-montain-far.png"), 0.05)
+    mountains   = ParallaxLayer(asset("parallax-mountain-mountains.png"),   0.15)
+    trees       = ParallaxLayer(asset("parallax-mountain-trees.png"),       0.30)
+    fg_trees    = ParallaxLayer(asset("parallax-mountain-foreground-trees.png"), 0.55)
+    ground      = GroundLayer(asset("wall128x128.png"))
+
+    player   = Player()
+    lvl_mgr  = LevelManager()
+    world_offset = 0.0   # cumulative world scroll
+
+    # Initial enemies
+    enemies = [Skeleton(DISPLAY_W * 0.8 + i * 260, lvl_mgr) for i in range(3)]
+    drops   = []
+
+    # Music
+    try:
+        pygame.mixer.music.load(asset("parallax-mountain-music.flac"))
+        pygame.mixer.music.set_volume(0.5)
+        pygame.mixer.music.play(-1)
+    except:
+        pass
+
+    frame_count  = 0
+    game_over    = False
+    title_screen = True
+
+    while True:
+        events = pygame.event.get()
+        for ev in events:
+            if ev.type == pygame.QUIT:
+                return False
+            if ev.type == pygame.KEYDOWN:
+                if ev.key in (pygame.K_ESCAPE, pygame.K_q):
+                    return False
+                if title_screen:
+                    title_screen = False
+                if game_over and ev.key == pygame.K_r:
+                    return True   # signal: restart
+
+        if not title_screen and not game_over:
+            frame_count += 1
+
+            # ── Player input & update ─────────────────────────────────────────
+            player.handle_input(events)
+            player.update()
+            dx = player.world_scroll_dx()
+            world_offset += dx
+
+            # ── Scroll layers ─────────────────────────────────────────────────
+            far_mtn.scroll(dx)
+            mountains.scroll(dx)
+            trees.scroll(dx)
+            fg_trees.scroll(dx)
+            ground.scroll(dx)
+
+            # ── Enemy logic ───────────────────────────────────────────────────
+            maybe_spawn(enemies, world_offset, frame_count, lvl_mgr)
+            lvl_mgr.update()
+            attack_rect = player.attack_rect()
+            for e in enemies:
+                hit_player = e.update(player.x, world_offset, attack_rect)
+                if hit_player and not player.dead:
+                    player.take_hit(1)
+                if not e.alive and e.death_timer == 1:
+                    player.score += int(100 * e.size_scale * lvl_mgr.level)
+                    lvl_mgr.register_kill()
+                    if random.random() < HealthDrop.DROP_CHANCE:
+                        drops.append(HealthDrop(e.x - world_offset + world_offset))
+            # Mark attack as having landed once collision found
+            if attack_rect:
+                for e in enemies:
+                    if e.alive and e.invuln > 0:
+                        player.attack_hit = True
+                        break
+            enemies = [e for e in enemies if not e.screen_dead_and_done]
+
+            # ── Health drops ──────────────────────────────────────────────────
+            for d in drops:
+                healed = d.update(player.x, world_offset)
+                if healed and player.hp < player.MAX_HP:
+                    player.hp += 1
+                    spawn_hit_particles(int(player.x), int(player.y) - 40, HPGREEN, 12)
+            drops = [d for d in drops if not d.expired]
+
+            if player.dead:
+                game_over = True
+
+        # ── Draw ─────────────────────────────────────────────────────────────
+        bg.draw(screen)
+        far_mtn.draw(screen)
+        mountains.draw(screen)
+        trees.draw(screen)
+        fg_trees.draw(screen)
+        ground.draw(screen)
+
+        # Player (drawn first so enemies appear on top when attacking)
+        player.draw(screen)
+
+        # Enemies
+        for e in enemies:
+            e.draw(screen, world_offset)
+
+        # Health drops
+        for d in drops:
+            d.draw(screen, world_offset)
+
+        # Particles
+        update_draw_particles(screen)
+
+        # (attack arc visual removed)
+
+        # HUD
+        if not title_screen:
+            draw_hud(screen, player)
+            draw_level_hud(screen, lvl_mgr)
+            if lvl_mgr.showing_banner:
+                draw_level_banner(screen, lvl_mgr)
+
+        if title_screen:
+            draw_title(screen)
+        elif game_over:
+            draw_game_over(screen, player.score)
+
+        pygame.display.flip()
+        clock.tick(FPS)
+
+def main():
+    while True:
+        restart = run_game()
+        if not restart:
+            break
+    pygame.quit()
+    sys.exit()
+
+if __name__ == "__main__":
+    main()
